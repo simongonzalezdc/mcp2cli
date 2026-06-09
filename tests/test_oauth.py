@@ -4,7 +4,6 @@ import json
 import os
 import subprocess
 import sys
-from pathlib import Path
 
 import pytest
 
@@ -368,8 +367,11 @@ class TestBuildOAuthProvider:
         )
         assert isinstance(provider, OAuthClientProvider)
 
-    def test_auth_code_random_port_when_no_redirect_uri(self, monkeypatch):
-        """Without redirect_uri, _find_free_port() is called and the default URI is built."""
+    def test_auth_code_random_port_when_no_redirect_uri(self, tmp_path, monkeypatch):
+        """Without redirect_uri and no cached client, _find_free_port() is called and the default URI is built."""
+        # Isolate OAUTH_DIR so no stale client.json interferes
+        monkeypatch.setattr(mcp2cli, "OAUTH_DIR", tmp_path / "oauth")
+
         called_with = []
 
         original = mcp2cli._find_free_port
@@ -597,3 +599,158 @@ class TestCallbackHandler:
 
         assert mcp2cli._CallbackHandler.error == "access_denied"
         assert mcp2cli._CallbackHandler.auth_code is None
+
+
+class TestCachedRedirectUriReuse:
+    """Tests for issue #54 fix: reuse cached redirect_uri when port is free."""
+
+    def test_no_cache_picks_random_port(self, tmp_path, monkeypatch):
+        """When no client.json exists, a random port is chosen as before."""
+        monkeypatch.setattr(mcp2cli, "OAUTH_DIR", tmp_path / "oauth")
+
+        # Ensure no cached client
+        storage = mcp2cli.FileTokenStorage("https://example.com/mcp")
+        assert not storage._client_path.exists()
+
+        provider = mcp2cli.build_oauth_provider("https://example.com/mcp")
+        redirect_uris = [str(u) for u in provider.context.client_metadata.redirect_uris]
+        # Should be a loopback URI with some port
+        assert len(redirect_uris) == 1
+        assert redirect_uris[0].startswith("http://127.0.0.1:")
+        assert redirect_uris[0].endswith("/callback")
+
+    def test_cached_redirect_uri_reused(self, tmp_path, monkeypatch):
+        """When client.json exists with a redirect_uri, that port is reused."""
+        import anyio
+        from mcp.shared.auth import OAuthClientInformationFull
+
+        monkeypatch.setattr(mcp2cli, "OAUTH_DIR", tmp_path / "oauth")
+        storage = mcp2cli.FileTokenStorage("https://example.com/mcp")
+
+        # Pick a port that is free right now
+        port = mcp2cli._find_free_port()
+
+        async def _seed():
+            await storage.set_client_info(
+                OAuthClientInformationFull(
+                    client_id="cached-dcr-id",
+                    redirect_uris=[f"http://127.0.0.1:{port}/callback"],
+                )
+            )
+
+        anyio.run(_seed)
+
+        # Now build the provider — should reuse the cached port
+        provider = mcp2cli.build_oauth_provider("https://example.com/mcp")
+        redirect_uris = [str(u) for u in provider.context.client_metadata.redirect_uris]
+        assert redirect_uris[0] == f"http://127.0.0.1:{port}/callback"
+
+    def test_cached_redirect_uri_port_taken_falls_back(self, tmp_path, monkeypatch):
+        """When the cached port is occupied, clear client.json and pick a new port."""
+        import anyio
+        import socket
+        from mcp.shared.auth import OAuthClientInformationFull
+
+        monkeypatch.setattr(mcp2cli, "OAUTH_DIR", tmp_path / "oauth")
+        storage = mcp2cli.FileTokenStorage("https://example.com/mcp")
+
+        # Use a port that we'll hold open
+        blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        blocker.bind(("127.0.0.1", 0))
+        taken_port = blocker.getsockname()[1]
+
+        async def _seed():
+            await storage.set_client_info(
+                OAuthClientInformationFull(
+                    client_id="cached-dcr-id",
+                    redirect_uris=[f"http://127.0.0.1:{taken_port}/callback"],
+                )
+            )
+
+        anyio.run(_seed)
+
+        # Build provider while port is still held
+        provider = mcp2cli.build_oauth_provider("https://example.com/mcp")
+        redirect_uris = [str(u) for u in provider.context.client_metadata.redirect_uris]
+
+        # Should NOT be the taken port
+        assert redirect_uris[0] != f"http://127.0.0.1:{taken_port}/callback"
+        # Should still be a valid callback URI
+        assert redirect_uris[0].startswith("http://127.0.0.1:")
+        assert redirect_uris[0].endswith("/callback")
+
+        # client.json should have been cleared (stale)
+        assert not storage._client_path.exists()
+
+        blocker.close()
+
+    def test_get_cached_redirect_uri_no_file(self, tmp_path, monkeypatch):
+        """_get_cached_redirect_uri returns None when client.json absent."""
+        monkeypatch.setattr(mcp2cli, "OAUTH_DIR", tmp_path / "oauth")
+        storage = mcp2cli.FileTokenStorage("https://example.com/mcp")
+        assert mcp2cli._get_cached_redirect_uri(storage) is None
+
+    def test_get_cached_redirect_uri_with_file(self, tmp_path, monkeypatch):
+        """_get_cached_redirect_uri reads the first redirect_uri from client.json."""
+        monkeypatch.setattr(mcp2cli, "OAUTH_DIR", tmp_path / "oauth")
+        storage = mcp2cli.FileTokenStorage("https://example.com/mcp")
+        storage._client_path.write_text(
+            json.dumps({"redirect_uris": ["http://127.0.0.1:43210/callback"]})
+        )
+        assert mcp2cli._get_cached_redirect_uri(storage) == "http://127.0.0.1:43210/callback"
+
+    def test_get_cached_redirect_uri_corrupt_file(self, tmp_path, monkeypatch):
+        """_get_cached_redirect_uri returns None for corrupt client.json."""
+        monkeypatch.setattr(mcp2cli, "OAUTH_DIR", tmp_path / "oauth")
+        storage = mcp2cli.FileTokenStorage("https://example.com/mcp")
+        storage._client_path.write_text("not json{{{")
+        assert mcp2cli._get_cached_redirect_uri(storage) is None
+
+    def test_get_cached_redirect_uri_empty_uris(self, tmp_path, monkeypatch):
+        """_get_cached_redirect_uri returns None when redirect_uris is empty."""
+        monkeypatch.setattr(mcp2cli, "OAUTH_DIR", tmp_path / "oauth")
+        storage = mcp2cli.FileTokenStorage("https://example.com/mcp")
+        storage._client_path.write_text(json.dumps({"redirect_uris": []}))
+        assert mcp2cli._get_cached_redirect_uri(storage) is None
+
+    def test_port_available_free_port(self):
+        """_port_available returns True for a free port."""
+        port = mcp2cli._find_free_port()
+        assert mcp2cli._port_available("127.0.0.1", port) is True
+
+    def test_port_available_taken_port(self):
+        """_port_available returns False for a taken port."""
+        import socket
+
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind(("127.0.0.1", 0))
+        taken_port = s.getsockname()[1]
+        assert mcp2cli._port_available("127.0.0.1", taken_port) is False
+        s.close()
+
+    def test_explicit_redirect_uri_not_affected_by_cache(self, tmp_path, monkeypatch):
+        """An explicit redirect_uri is not overridden by a cached client."""
+        import anyio
+        from mcp.shared.auth import OAuthClientInformationFull
+
+        monkeypatch.setattr(mcp2cli, "OAUTH_DIR", tmp_path / "oauth")
+        storage = mcp2cli.FileTokenStorage("https://example.com/mcp")
+
+        async def _seed():
+            await storage.set_client_info(
+                OAuthClientInformationFull(
+                    client_id="cached-dcr-id",
+                    redirect_uris=["http://127.0.0.1:54321/callback"],
+                )
+            )
+
+        anyio.run(_seed)
+
+        # Pass an explicit redirect_uri — should be used as-is
+        provider = mcp2cli.build_oauth_provider(
+            "https://example.com/mcp",
+            redirect_uri="http://localhost:19890/callback",
+        )
+        redirect_uris = [str(u) for u in provider.context.client_metadata.redirect_uris]
+        assert "http://localhost:19890/callback" in redirect_uris
+        assert "http://127.0.0.1:54321/callback" not in redirect_uris

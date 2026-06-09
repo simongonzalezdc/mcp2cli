@@ -668,6 +668,43 @@ def _find_free_port() -> int:
         return s.getsockname()[1]
 
 
+
+
+def _get_cached_redirect_uri(storage: "FileTokenStorage") -> str | None:
+    """Return the cached client's redirect_uri, if any.
+
+    Reads client.json from disk without async. Returns None when
+    no cached client exists or the redirect_uri cannot be parsed.
+
+    Used by build_oauth_provider to reuse the registered redirect
+    port from a prior DCR run (issue #54).
+    """
+    if not storage._client_path.exists():
+        return None
+    try:
+        data = json.loads(storage._client_path.read_text())
+        uris = data.get("redirect_uris") or []
+        if uris:
+            return uris[0]
+    except Exception:
+        pass
+    return None
+
+
+def _port_available(host: str, port: int) -> bool:
+    """Check whether *port* is free on *host*.
+
+    Note: this is a best-effort probe — a TOCTOU race exists where another
+    process could bind the port between this check and the caller's use.
+    Callers must handle bind failures gracefully.
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind((host, port))
+            return True
+    except OSError:
+        return False
+
 def build_oauth_provider(
     server_url: str,
     *,
@@ -794,9 +831,36 @@ def build_oauth_provider(
         callback_host = parsed.hostname
         port = parsed.port
     else:
-        port = _find_free_port()
-        callback_host = "127.0.0.1"
-        redirect_uri = f"http://127.0.0.1:{port}/callback"
+        # Issue #54: When DCR is used without an explicit redirect_uri,
+        # _find_free_port() picks a new random port on every run.  If a
+        # cached client.json already exists (from a prior run), its
+        # registered redirect_uris[0] carries the ORIGINAL port.  Sending
+        # an auth request with a different port causes the auth server to
+        # reject the mismatch ("callback URL is invalid").
+        #
+        # Fix: reuse the cached redirect_uri if its port is still available.
+        # If the cached port is occupied (unlikely for loopback), clear the
+        # stale client so DCR re-registers with the fresh port.
+        cached_uri = _get_cached_redirect_uri(storage)
+        if cached_uri is not None:
+            from urllib.parse import urlparse as _urlparse
+            _parsed = _urlparse(cached_uri)
+            _cached_port = _parsed.port
+            _cached_host = _parsed.hostname or "127.0.0.1"
+            if _cached_port and _port_available(_cached_host, _cached_port):
+                callback_host = _cached_host
+                port = _cached_port
+                redirect_uri = cached_uri
+            else:
+                # Port no longer free — clear stale client and re-register
+                storage.clear_client_info()
+                port = _find_free_port()
+                callback_host = "127.0.0.1"
+                redirect_uri = f"http://127.0.0.1:{port}/callback"
+        else:
+            port = _find_free_port()
+            callback_host = "127.0.0.1"
+            redirect_uri = f"http://127.0.0.1:{port}/callback"
 
     client_metadata = OAuthClientMetadata(
         client_name=client_name,
@@ -846,7 +910,7 @@ def build_oauth_provider(
         server = HTTPServer((callback_host, port), _CallbackHandler)
 
     async def redirect_handler(auth_url: str) -> None:
-        print(f"Opening browser for authorization...", file=sys.stderr)
+        print("Opening browser for authorization...", file=sys.stderr)
         print(f"If browser doesn't open, visit: {auth_url}", file=sys.stderr)
         webbrowser.open(auth_url)
 
